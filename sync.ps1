@@ -19,7 +19,7 @@ function Stop-SyncChildTree {
 
 function ConvertTo-CygwinPath {
     param([string]$Path)
-    if ($Path -notmatch '^[A-Za-z]:[\\/]' -or $Path -match '[\x00-\x1f\x7f"]') {
+    if ($Path -notmatch '^[A-Za-z]:[\\/]' -or $Path -match '[\x00-\x1f\x7f"<>|?*]' -or $Path.Substring(2).Contains(':')) {
         throw 'Use an absolute Windows drive path, such as D:\Projects\Site. UNC paths are not supported.'
     }
     $full = [IO.Path]::GetFullPath($Path).Replace('\', '/')
@@ -43,6 +43,8 @@ function Invoke-SyncNative {
         [int]$TimeoutSeconds = 60,
         [switch]$Progress
     )
+    # Fail closed even for direct helper calls: never start a local receiver or a root scan.
+    if ([IO.Path]::GetFileName($Executable) -ieq 'rsync.exe') { Assert-SyncRsyncArguments $Arguments }
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $Executable
     $info.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
@@ -415,11 +417,45 @@ function Get-SyncEvents {
     return $events
 }
 
+function Assert-SyncRsyncArguments {
+    param([string[]]$Arguments)
+    if ($Arguments.Count -eq 1 -and $Arguments[0] -ceq '--version') { return }
+    $invalid = 'Unsafe rsync arguments; expected approved options, --, one non-root Windows source and one remote destination.'
+    $fixed = @('-rt', '--omit-dir-times', '--open-noatime', '--one-file-system', '--secluded-args',
+        '--itemize-changes', '--out-format=SYNC|%i|%n%L', '--stats', '-e')
+    if ($Arguments.Count -lt 16) { throw $invalid }
+    for ($i = 0; $i -lt $fixed.Count; $i++) {
+        if ($Arguments[$i] -cne $fixed[$i]) { throw $invalid }
+    }
+    if ([string]::IsNullOrWhiteSpace($Arguments[9]) -or
+        -not $Arguments[10].StartsWith('--rsync-path=sh -c ')) { throw $invalid }
+    $i = 11
+    if ($Arguments[$i++] -cnotin @('--checksum', '--ignore-existing')) { throw $invalid }
+    if ($Arguments[$i] -ceq '--delete-delay') {
+        $i++
+        if ($Arguments[$i] -cmatch '^--max-delete=[0-9]+$') { $i++ }
+    }
+    elseif ($Arguments[$i++] -cne '--max-delete=0') { throw $invalid }
+    if ($Arguments[$i++] -cnotin @('--dry-run', '--info=progress2')) { throw $invalid }
+    if ($Arguments.Count -ne $i + 3 -or $Arguments[$i++] -cne '--') { throw $invalid }
+    $source = $Arguments[$i++]
+    if ($source -cnotmatch '^/cygdrive/[a-z]/[^/].*/$' -or
+        $source -match '[\x00-\x1f\x7f"\\]' -or $source.Contains('//')) { throw $invalid }
+    $windows = $source.Substring(10,1) + ':\' + $source.Substring(12).Replace('/', '\')
+    if ((ConvertTo-CygwinPath $windows) -cne $source) { throw $invalid }
+    $destination = $Arguments[$i]
+    if ($destination -notmatch '^([^:]+):(/.+/)$') { throw $invalid }
+    if (-not (Test-SyncSetting 'sshHost' $Matches[1])) { throw $invalid }
+    [void](Get-SyncDestination $Matches[2])
+}
+
 function Invoke-SyncRsync {
     param($Transport, $Source, $Remote, $Settings, [switch]$Preview, [int]$MaxDelete = -1)
+    $expectedSource = (ConvertTo-CygwinPath $Source.Path).TrimEnd('/') + '/'
+    if ($Source.CygwinPath -cne $expectedSource) { throw 'Source conversion mismatch; refusing rsync.' }
     $guard = Get-RemoteGuardScript $Remote.Path -Protocol -ExpectedIdentity $Remote.Identity
     $remoteCommand = 'sh -c ' + (ConvertTo-PosixLiteral $guard) + ' sync-guard'
-    $arguments = @('-rt', '--omit-dir-times', '--one-file-system', '--secluded-args', '--itemize-changes',
+    $arguments = @('-rt', '--omit-dir-times', '--open-noatime', '--one-file-system', '--secluded-args', '--itemize-changes',
         '--out-format=SYNC|%i|%n%L', '--stats', '-e', $Transport.Rsh, ('--rsync-path=' + $remoteCommand))
     if ($Settings.transferModifiedFiles) { $arguments += '--checksum' }
     else { $arguments += '--ignore-existing' }
@@ -430,6 +466,7 @@ function Invoke-SyncRsync {
     else { $arguments += '--max-delete=0' }
     if ($Preview) { $arguments += '--dry-run' } else { $arguments += '--info=progress2' }
     $arguments += @('--', $Source.CygwinPath, ($Transport.HostAlias + ':' + $Remote.Path.TrimEnd('/') + '/'))
+    Assert-SyncRsyncArguments $arguments
     $environment = @{ PATH = $Transport.Tools.Bin + ';' + $env:Path }
     $result = Invoke-SyncNative $Transport.Tools.Rsync $arguments -Environment $environment -TimeoutSeconds 0 -Progress:(-not $Preview)
     Write-Host $result.Output.TrimEnd()

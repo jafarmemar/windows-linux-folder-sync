@@ -48,7 +48,18 @@ The script uses cwRsync's `ssh.exe` for both checks and transfers. It reads the 
 
 Windows drive paths are converted to `/cygdrive/c/...` internally. Drive roots, Windows system folders, the profile root, SSH folders, and sources containing symlinks/junctions are rejected. UNC sources are unsupported.
 
+Before launching rsync, the script checks the complete argument vector: only approved options, exactly one non-root Windows source and one remote destination are accepted. Missing/extra operands, standalone `/` operands and inconsistent path conversions stop execution. This prevents a malformed command from starting a local receiver.
+
 Linux system roots, sensitive system subtrees, user home roots and `.ssh` directories are protected. Dedicated subdirectories under `/srv`, `/opt`, `/home/<user>` and `/tmp` may be used. Symlinked destinations or parents and destinations containing filesystem mounts are rejected. Checks run before preview, before transfer and inside the remote rsync launcher. Deletion is blocked when the source has no regular files. Use trusted, dedicated directories; do not modify their paths or mounts during synchronization.
+
+### Transfer options and source metadata
+
+- `-rt` recursively transfers files and preserves **destination file modification times**; `--omit-dir-times` excludes directory times. Owner, group, ACL and extended-attribute preservation are not enabled. No source-removal or source-writing options are permitted.
+- `--one-file-system` limits traversal; source junctions/symlinks are separately rejected. `--secluded-args`, `-e` and `--rsync-path` carry literal paths through the checked SSH transport and remote guard; `--` separates options from the two operands.
+- `--checksum` detects content changes; `--ignore-existing` implements new-files-only mode. `--delete-delay` applies approved destination deletions; `--max-delete` caps their number. The cap alone does not prevent type replacement, so conflicts are checked separately.
+- `--dry-run` previews; `--itemize-changes`, `--out-format`, `--stats` and `--info=progress2` report changes and progress.
+
+The Windows source is the sender, never the receiver. Reads can still update last-access times under Windows/filesystem policy. `--open-noatime` requests suppression where supported; unsupported systems silently ignore it ([rsync manual](https://download.samba.org/pub/rsync/rsync.1.html)). Directory enumeration and other software may also affect access times. Unchanged access times are not guaranteed, and the script never attempts to restore metadata.
 
 ## Troubleshooting
 

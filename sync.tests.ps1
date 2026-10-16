@@ -51,6 +51,20 @@ function Write-TestText {
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Get-TestSourceMetadata {
+    param([string]$Root)
+    $records = @(Get-Item -LiteralPath $Root) + @(Get-ChildItem -LiteralPath $Root -Recurse -Force)
+    foreach ($item in ($records | Sort-Object FullName)) {
+        $hash = if ($item.PSIsContainer) { '' } else { (Get-FileHash -LiteralPath $item.FullName).Hash }
+        $item.Refresh()
+        [pscustomobject]@{
+            Path=$item.FullName; Hash=$hash; Security=(Get-Acl -LiteralPath $item.FullName).Sddl
+            Attributes=[int]$item.Attributes; Created=$item.CreationTimeUtc.Ticks; Written=$item.LastWriteTimeUtc.Ticks
+            Accessed=$item.LastAccessTimeUtc.Ticks
+        }
+    }
+}
+
 $testRoot = Join-Path $env:TEMP ('wlfs-tests-' + [guid]::NewGuid().ToString('N'))
 $remoteRoot = '/tmp/wlfs-integration-' + [guid]::NewGuid().ToString('N')
 $remoteIdentity = ''
@@ -168,15 +182,71 @@ try {
             return [pscustomobject]@{ExitCode=0;Output='';Error=''}
         }
         $mockTransport = [pscustomobject]@{Tools=[pscustomobject]@{Rsync='never-executed';Bin='C:\safe bin'};Rsh='ssh';HostAlias='apps'}
-        $mockSource = [pscustomobject]@{CygwinPath='/cygdrive/c/safe source/'}
+        $mockSource = [pscustomobject]@{Path='C:\safe source';CygwinPath='/cygdrive/c/safe source/'}
         $mockRemote = [pscustomobject]@{Path='/tmp/safe-target';Identity='missing'}
         $null = Invoke-SyncRsync $mockTransport $mockSource $mockRemote $settings -Preview
         Assert-Test ($script:CapturedArguments[-3] -ceq '--' -and $script:CapturedArguments[-2] -ceq '/cygdrive/c/safe source/' -and
             $script:CapturedArguments[-1] -ceq 'apps:/tmp/safe-target/' -and '/' -notin $script:CapturedArguments) 'Production argument vector contains exactly one safe source and one remote destination'
         Assert-Test ('--max-delete=0' -in $script:CapturedArguments -and '--secluded-args' -in $script:CapturedArguments) 'No-delete cap and protected remote arguments are explicit'
         Assert-Test ($script:CapturedEnvironment.PATH.StartsWith('C:\safe bin;') -and $env:Path -ceq $pathBefore) 'cwRsync PATH priority is scoped to the rsync child only'
+        $validArguments = @($script:CapturedArguments)
+        $mockSource.CygwinPath = '/cygdrive/c/wrong/'
+        Assert-Throws { Invoke-SyncRsync $mockTransport $mockSource $mockRemote $settings -Preview } '*conversion mismatch*' 'Reject a mismatched source conversion before invoking native code'
     }
     finally { Set-Item Function:\Invoke-SyncNative $realNative }
+    Assert-SyncRsyncArguments $validArguments
+    Assert-Test $true 'Accept the exact production argument grammar'
+    # Reproduce the historical parser error IN MEMORY ONLY. Never execute this vector.
+    $s = 'C:\safe source'; $d = 'C:\safe target'
+    $broken = @('-rt', '--max-delete=0', (ConvertTo-CygwinPath $s)+'/', (ConvertTo-CygwinPath $d)+'/')
+    Assert-Test ($broken.Count -eq 6 -and $broken[3] -ceq '/' -and $broken[5] -ceq '/') 'Historical array expression produces two standalone root operands'
+    $ledgerBefore = $script:SyncProcessLedger.Count
+    Assert-Throws { Invoke-SyncNative 'rsync.exe' $broken } '*Unsafe rsync arguments*' 'Historical malformed vector is blocked before process creation'
+    foreach ($sourceOperand in @('/', '/cygdrive/c', '/cygdrive/c/', '/cygdrive/c/../', '/cygdrive/c/a/../../',
+        '/cygdrive/c//data/', '/cygdrive/c/a"b/', '/cygdrive/C/data/', '/c/data/', '/mnt/c/data/', '', '/cygdrive/c/data')) {
+        $bad = @($validArguments); $bad[-2] = $sourceOperand
+        Assert-Throws { Invoke-SyncNative 'rsync.exe' $bad } '*' "Block invalid source operand [$sourceOperand] before launch"
+    }
+    foreach ($destinationOperand in @('/', '/cygdrive/c/target/', 'apps:/', 'apps:/etc/', 'apps:relative', 'apps::module')) {
+        $bad = @($validArguments); $bad[-1] = $destinationOperand
+        Assert-Throws { Invoke-SyncNative 'rsync.exe' $bad } '*' "Block local, protected or malformed destination [$destinationOperand]"
+    }
+    $invalidVectors = New-Object 'Collections.Generic.List[object]'
+    $invalidVectors.Add(@($validArguments[0..($validArguments.Count-2)]))
+    $invalidVectors.Add(@($validArguments + '/'))
+    $invalidVectors.Add(@(@('--remove-source-files') + $validArguments))
+    $invalidVectors.Add(@(@('-a') + $validArguments))
+    $invalidVectors.Add(@())
+    foreach ($index in @(8, 9, 10, ($validArguments.Count-3))) {
+        $bad = @($validArguments); $bad[$index] = ''
+        $invalidVectors.Add($bad)
+    }
+    $bad = @($validArguments); $bad[-2] = (ConvertTo-CygwinPath 'C:\safe\..')
+    $invalidVectors.Add($bad)
+    foreach ($bad in $invalidVectors) {
+        Assert-Throws { Invoke-SyncNative 'rsync.exe' $bad } '*' 'Reject incomplete, extra or unapproved arguments before launch'
+    }
+    Assert-Test ($script:SyncProcessLedger.Count -eq $ledgerBefore) 'All malformed argument regressions started zero processes'
+    foreach ($path in @('C:relative', '/cygdrive/c/data', 'C:\a"b', 'C:\a:b', 'C:\a*', "C:\bad`npath")) {
+        Assert-Throws { ConvertTo-CygwinPath $path } '*' 'Reject invalid Windows path conversion'
+    }
+    Assert-Test ((ConvertTo-CygwinPath "C:\space ' quote\data") -ceq "/cygdrive/c/space ' quote/data") 'Apostrophes and spaces remain literal in source conversion'
+    # A harmless argv recorder verifies the actual Windows process boundary, never rsync.
+    $recorder = Join-Path $testRoot 'argv recorder.exe'
+    Add-Type -OutputAssembly $recorder -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.Text;
+public class ArgvRecorder {
+    public static void Main(string[] args) {
+        foreach (string arg in args) Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(arg)));
+    }
+}
+'@
+    $literalArguments = @('', 'space in argument', 'embedded "quote"', 'backslash\"quote', 'trailing slash\', "apostrophe ' literal")
+    $recorded = Invoke-SyncNative $recorder $literalArguments
+    Assert-SyncSuccess $recorded 'Argument recorder'
+    $expectedRecords = @($literalArguments | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) })
+    Assert-Test ($recorded.Output.Replace("`r`n", "`n") -ceq (($expectedRecords -join "`n") + "`n")) 'Native argv preserves empty values, spaces, quotes, apostrophes and trailing backslashes'
     $example = Get-Content (Join-Path $PSScriptRoot 'config.example.json') -Raw | ConvertFrom-Json
     foreach ($prop in $example.PSObject.Properties) { Assert-Test (Test-SyncSetting $prop.Name $prop.Value) "Example setting $($prop.Name) is valid" }
 
@@ -202,8 +272,15 @@ stat -Lc '%d:%i' -- "$root"
         Write-TestText (Join-Path $source 'delete-me.txt') 'delete test payload'
         $destination = $remoteRoot + "/target space ' ; false ; # " + [char]0x00e9
         $settings = [pscustomobject]@{sourcePath=$source;destinationPath=$destination;sshHost='apps';transferModifiedFiles=$true;deleteRemovedFiles=$false}
+        $metadataBefore = @(Get-TestSourceMetadata $source)
         Set-TestAnswers @($destination)
         $first = Invoke-FolderSync $settings
+        $metadataAfter = @(Get-TestSourceMetadata $source)
+        $stableFields = @('Path','Hash','Security','Attributes','Created','Written')
+        Assert-Test (($metadataBefore | Select-Object $stableFields | ConvertTo-Json -Depth 3 -Compress) -ceq
+            ($metadataAfter | Select-Object $stableFields | ConvertTo-Json -Depth 3 -Compress)) 'Real transfer preserves source content, owner/ACL, attributes, creation and modification times'
+        $accessChanges = @(Compare-Object $metadataBefore $metadataAfter -Property Path,Accessed).Count
+        Write-Host "Source last-access observations differ: $accessChanges records (OS-dependent; no restoration attempted)."
         Assert-Test (@($first.Events | Where-Object { $_.Code -match '^<f\+{9}$' }).Count -eq 3) 'Create approved target and transfer three new files; spaces/apostrophes/shell characters are literal'
         Assert-RemoteHash (Join-Path $source 'alpha.txt') ($destination+'/alpha.txt') 'Initial alpha SHA-256 matches Ubuntu'
         Assert-RemoteHash (Join-Path $source "nested\space ' file.txt") ($destination+"/nested/space ' file.txt") 'Nested filename with spaces/apostrophe transfers correctly'
@@ -213,7 +290,11 @@ stat -Lc '%d:%i' -- "$root"
         $stamp = (Get-Item $alpha).LastWriteTimeUtc
         Write-TestText $alpha 'BBBB'
         (Get-Item $alpha).LastWriteTimeUtc = $stamp
+        $metadataBefore = @(Get-TestSourceMetadata $source)
         $changed = Invoke-FolderSync $settings -NonInteractive
+        $metadataAfter = @(Get-TestSourceMetadata $source)
+        Assert-Test (($metadataBefore | Select-Object $stableFields | ConvertTo-Json -Depth 3 -Compress) -ceq
+            ($metadataAfter | Select-Object $stableFields | ConvertTo-Json -Depth 3 -Compress)) 'Checksum/update transfer also preserves source content and stable metadata'
         Assert-Test (@($changed.Events | Where-Object { $_.Code -match '^<fc' }).Count -eq 1) 'Checksum detects changed content with identical size and timestamp'
         Assert-RemoteHash $alpha ($destination+'/alpha.txt') 'Modified file SHA-256 matches Ubuntu'
         $expectedAlpha = Join-Path $testRoot 'expected-alpha.txt'
