@@ -49,7 +49,7 @@ One-way Windows-to-Linux folder synchronization using rsync over SSH, with incre
    $processEntries = @($env:Path -split ';' | Where-Object {
        $_ -and ([Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ine $binKey)
    })
-   $env:Path = (@($targetBin) + $processEntries) -join ';'
+   $env:Path = (@($processEntries) + $targetBin) -join ';'
 
    $ErrorActionPreference = 'Continue'
    $sshVersion = & (Join-Path $targetBin 'ssh.exe') -V 2>&1 | ForEach-Object { $_.ToString() }
