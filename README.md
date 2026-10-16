@@ -51,8 +51,12 @@ One-way Windows-to-Linux folder synchronization using rsync over SSH, with incre
    })
    $env:Path = (@($targetBin) + $processEntries) -join ';'
 
-   & (Join-Path $targetBin 'ssh.exe') -V 2>&1
-   if ($LASTEXITCODE -ne 0) { throw 'cwRsync SSH check failed.' }
+   $ErrorActionPreference = 'Continue'
+   $sshVersion = & (Join-Path $targetBin 'ssh.exe') -V 2>&1 | ForEach-Object { $_.ToString() }
+   $sshExitCode = $LASTEXITCODE
+   $ErrorActionPreference = 'Stop'
+   if ($sshExitCode -ne 0) { throw 'cwRsync SSH check failed.' }
+   $sshVersion
    rsync --version
    if ($LASTEXITCODE -ne 0) { throw 'rsync version check failed.' }
    ```
