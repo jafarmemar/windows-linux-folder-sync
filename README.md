@@ -3,64 +3,61 @@ One-way Windows-to-Linux folder synchronization using rsync over SSH, with incre
 
 ## Installation
 
-### Windows 11 (cwRsync 6.5.0)
+### Windows 11 (cwRsync)
 
-1. Download [cwRsync 6.5.0 for Windows x64](https://itefix.net/downloads/cwrsync/cwrsync_6.5.0_x64_free.zip) from the [official Itefix website](https://itefix.net/cwrsync/).
-2. Open PowerShell as **Administrator**. Save the ZIP in your Downloads folder (or update `$zip` below), then run:
+1. Download the **Latest Version** cwRsync ZIP from the [official Itefix website](https://itefix.net/cwrsync/). Compare its checksum with the value published there for that release.
+2. Extract the ZIP file.
+3. Open PowerShell as **Administrator** and navigate to the extracted folder containing the package's top-level `bin` directory.
+4. Run these commands to install cwRsync system-wide:
 
    ```powershell
    $ErrorActionPreference = 'Stop'
-   $zip = Join-Path $env:USERPROFILE 'Downloads\cwrsync_6.5.0_x64_free.zip'
+   $source = (Get-Location).Path
+   $sourceBin = Join-Path $source 'bin'
    $destination = 'C:\Program Files\cwRsync'
-   $bin = Join-Path $destination 'bin'
-   $expectedHash = '8dc20afec889908c05c2abaa21d37f3fcad3e7ea5f3f37e95b25e6178f6b983a'
+   $targetBin = Join-Path $destination 'bin'
 
-   $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-   if ($actualHash -ne $expectedHash) { throw 'SHA-256 mismatch; extraction stopped.' }
-
-   $rsyncExe = Join-Path $bin 'rsync.exe'
-   $sshExe = Join-Path $bin 'ssh.exe'
-   $installed = $false
-   if ((Test-Path -LiteralPath $rsyncExe -PathType Leaf) -and (Test-Path -LiteralPath $sshExe -PathType Leaf)) {
-       $rsyncVersion = (& $rsyncExe --version 2>&1 | Out-String)
-       $sshVersion = (& $sshExe -V 2>&1 | Out-String)
-       $installed = $rsyncVersion -match 'rsync version 3\.5\.1' -and $sshVersion -match 'OpenSSH_10\.6p1'
-   }
-   if ($installed) {
-       Write-Host 'cwRsync 6.5.0 is already present; skipping extraction.'
-   } else {
-       New-Item -ItemType Directory -Path $destination -Force | Out-Null
-       Expand-Archive -LiteralPath $zip -DestinationPath $destination -Force
+   if (-not (Test-Path -LiteralPath (Join-Path $sourceBin 'rsync.exe') -PathType Leaf) -or
+       -not (Test-Path -LiteralPath (Join-Path $sourceBin 'ssh.exe') -PathType Leaf)) {
+       throw 'The current folder must contain bin\rsync.exe and bin\ssh.exe.'
    }
 
-   if (-not (Test-Path -LiteralPath $rsyncExe -PathType Leaf) -or -not (Test-Path -LiteralPath $sshExe -PathType Leaf)) {
-       throw 'Expected executables were not found under C:\Program Files\cwRsync\bin.'
+   New-Item -ItemType Directory -Path $destination -Force | Out-Null
+   Copy-Item -Path (Join-Path $source '*') -Destination $destination -Recurse -Force
+
+   if (-not (Test-Path -LiteralPath (Join-Path $targetBin 'rsync.exe') -PathType Leaf) -or
+       -not (Test-Path -LiteralPath (Join-Path $targetBin 'ssh.exe') -PathType Leaf)) {
+       throw 'cwRsync files were not copied successfully.'
+   }
+
+   $binKey = $targetBin.TrimEnd('\')
+   $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+   $machineEntries = @($machinePath -split ';' | Where-Object { $_ -and $_.Trim() })
+   $hasMachineBin = $machineEntries | Where-Object {
+       [Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ieq $binKey
+   }
+   if (-not $hasMachineBin) {
+       [Environment]::SetEnvironmentVariable('Path', (@($machineEntries) + $targetBin) -join ';', 'Machine')
    }
 
    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-   $machineEntries = @($machinePath -split ';' | Where-Object { $_ -and $_.Trim() })
-   $machineHasBin = $machineEntries | Where-Object {
-       [Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ieq $bin.TrimEnd('\')
+   $hasMachineBin = $machinePath -split ';' | Where-Object {
+       $_ -and [Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ieq $binKey
    }
-   if (-not $machineHasBin) {
-       [Environment]::SetEnvironmentVariable('Path', (@($machineEntries) + $bin) -join ';', 'Machine')
-   }
+   if (-not $hasMachineBin) { throw 'Could not add cwRsync to Machine PATH.' }
 
    $processEntries = @($env:Path -split ';' | Where-Object {
-       $_ -and ([Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ine $bin.TrimEnd('\'))
+       $_ -and ([Environment]::ExpandEnvironmentVariables($_.Trim()).TrimEnd('\') -ine $binKey)
    })
-   $env:Path = (@($bin) + $processEntries) -join ';'
-   ```
+   $env:Path = (@($targetBin) + $processEntries) -join ';'
 
-   The ZIP has `bin/` at its root, so extraction places the executables directly under `C:\Program Files\cwRsync\bin`. The script adds this directory to Machine PATH without duplicating it.
-3. Verify in the elevated PowerShell window:
-
-   ```powershell
+   & (Join-Path $targetBin 'ssh.exe') -V 2>&1
+   if ($LASTEXITCODE -ne 0) { throw 'cwRsync SSH check failed.' }
    rsync --version
-   & 'C:\Program Files\cwRsync\bin\ssh.exe' -V
+   if ($LASTEXITCODE -ne 0) { throw 'rsync version check failed.' }
    ```
 
-The SSH check uses cwRsync's executable directly, avoiding Windows' built-in OpenSSH. `cwrsync.cmd` is a sample batch launcher, not an installer. WSL and MSYS2 are not required.
+5. Confirm the commands display cwRsync's SSH and rsync versions without errors.
 
 ### Ubuntu Server (rsync + OpenSSH)
 
