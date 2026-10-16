@@ -80,3 +80,7 @@ One-way Windows-to-Linux folder synchronization using rsync over SSH, with incre
    rsync --version
    systemctl is-active ssh
    ```
+
+## Usage
+
+Run `.\sync.ps1` in PowerShell. See the [Usage Guide](./USAGE.md) for configuration, previews, deletion approval and path protection.

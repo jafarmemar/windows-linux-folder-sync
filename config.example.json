@@ -1,0 +1,7 @@
+{
+  "sourcePath": "D:\\Projects\\MyProject",
+  "destinationPath": "/srv/myproject",
+  "sshHost": "apps",
+  "transferModifiedFiles": true,
+  "deleteRemovedFiles": false
+}
